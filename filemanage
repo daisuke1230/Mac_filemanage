@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -e
+
+usage() {
+  cat <<EOF
+用法：
+  filemanage [動作選項] [其他選項] [-e ext1,ext2,...] SRC [DEST]
+
+動作（四選一，必填）：
+  -m    move：搬移（依副檔名 或 -A 整包）
+  -c    copy：複製（依副檔名 或 -A 整包）
+  -d    delete：刪除（僅依副檔名）
+  -p    preview：預覽（依副檔名列檔案 或 -A 預覽整包操作）
+
+其他選項：
+  -A    整包資料夾模式（A2）：把 SRC 資料夾整包搬/拷到 DEST
+        -m -A：使用 mv
+        -c -A：使用 ditto（mac 友善，保留屬性/隱藏檔）
+        -p -A：只顯示將執行的命令
+        注意：-A 模式不需要 -e，且 -k 無效
+  -k    保留資料夾結構（僅對「依副檔名」的 move/copy 有效）
+  -e    副檔名列表（逗號分隔，例如：jpg,png,mp4；僅「依副檔名」模式必填）
+  -h    顯示說明
+
+參數：
+  SRC   來源資料夾
+  DEST  目標資料夾（move/copy 必填；delete/preview 依情境）
+
+範例：
+  # A2：整包搬移 ~/project 到 /backup（結果會變成 /backup/project）
+  filemanage -m -A ~/project /backup
+
+  # A2：整包複製 ~/project 到 /backup（結果會變成 /backup/project）
+  filemanage -c -A ~/project /backup
+
+  # A2：預覽將執行什麼命令
+  filemanage -p -A ~/project /backup
+
+  # 依副檔名：搬移 jpg,png，保留母資料夾+結構
+  filemanage -m -k -e jpg,png ~/Projects ~/Backup/ProjectsImages
+EOF
+}
+
+ACTION=""
+KEEP_STRUCTURE=0
+A_MODE=0
+EXTS=""
+
+# 解析短參數
+while getopts "mcdpAkhe:" opt; do
+  case "$opt" in
+    m) ACTION="move" ;;
+    c) ACTION="copy" ;;
+    d) ACTION="delete" ;;
+    p) ACTION="preview" ;;
+    A) A_MODE=1 ;;
+    k) KEEP_STRUCTURE=1 ;;
+    e) EXTS="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+
+SRC="${1:-}"
+DEST="${2:-}"
+
+# 基本檢查
+if [ -z "$ACTION" ]; then
+  echo "錯誤：必須指定一個動作（-m / -c / -d / -p）。"
+  usage
+  exit 1
+fi
+
+if [ -z "$SRC" ]; then
+  echo "錯誤：必須指定來源資料夾 SRC。"
+  usage
+  exit 1
+fi
+
+if [ ! -d "$SRC" ]; then
+  echo "錯誤：來源資料夾不存在：$SRC"
+  exit 1
+fi
+
+# 標準化 SRC
+SRC="${SRC%/}"
+SRC_BASENAME="$(basename "$SRC")"
+
+# ========= A2：整包資料夾模式 =========
+if [ "$A_MODE" -eq 1 ]; then
+  if [ "$ACTION" = "delete" ]; then
+    echo "錯誤：-A 模式不支援 delete（避免誤刪整包資料夾）。"
+    exit 1
+  fi
+
+  if [ -z "$DEST" ]; then
+    echo "錯誤：-A 模式下，必須提供 DEST。"
+    exit 1
+  fi
+
+  # -A 模式下 -k 無效（整包本來就保留結構）
+  if [ "$KEEP_STRUCTURE" -eq 1 ]; then
+    echo "提示：-A 模式會保留整包結構，-k 將忽略。"
+  fi
+
+  # 計算最終目標路徑：
+  # - 若 DEST 是存在的資料夾 → 放到 DEST/母資料夾名
+  # - 若 DEST 不存在或是檔名路徑 → 視為使用者指定的完整目標路徑
+  if [ -d "$DEST" ]; then
+    FINAL_DEST="$DEST/$SRC_BASENAME"
+  else
+    FINAL_DEST="$DEST"
+  fi
+
+  case "$ACTION" in
+    preview)
+      echo "[A2 preview]"
+      echo "SRC : $SRC"
+      echo "DEST: $FINAL_DEST"
+      echo "CMD : $([ -d "$DEST" ] && echo "(DEST 是資料夾 → 會落在 DEST/$(basename "$SRC"))" || echo "(DEST 視為完整目標路徑)")"
+      echo
+      echo "若執行搬移：mv \"$SRC\" \"$FINAL_DEST\""
+      echo "若執行複製：ditto \"$SRC\" \"$FINAL_DEST\""
+      exit 0
+      ;;
+    move)
+      if [ -e "$FINAL_DEST" ]; then
+        echo "錯誤：目標已存在：$FINAL_DEST（為避免覆蓋，已中止）"
+        exit 1
+      fi
+      echo "[A2 move] mv \"$SRC\" \"$FINAL_DEST\""
+      mv "$SRC" "$FINAL_DEST"
+      echo "完成。"
+      exit 0
+      ;;
+    copy)
+      # ditto 若目標存在會合併寫入；這裡不強制擋，但會提示
+      if [ -e "$FINAL_DEST" ]; then
+        echo "提示：目標已存在：$FINAL_DEST（ditto 可能合併/覆蓋同名檔）"
+      fi
+      echo "[A2 copy] ditto \"$SRC\" \"$FINAL_DEST\""
+      ditto "$SRC" "$FINAL_DEST"
+      echo "完成。"
+      exit 0
+      ;;
+    *)
+      echo "錯誤：不支援的動作：$ACTION"
+      exit 1
+      ;;
+  esac
+fi
+
+# ========= 依副檔名模式（原本功能） =========
+
+# 依副檔名模式：需要 -e（除非你要只做 preview 列清單也仍需要篩選規則）
+if [ -z "$EXTS" ]; then
+  echo "錯誤：必須使用 -e 指定副檔名列表（除非使用 -A 整包模式）。"
+  usage
+  exit 1
+fi
+
+case "$ACTION" in
+  move|copy)
+    if [ -z "$DEST" ]; then
+      echo "錯誤：動作為 move/copy 時必須指定目標資料夾 DEST。"
+      exit 1
+    fi
+    ;;
+  delete|preview)
+    ;;
+  *)
+    echo "錯誤：不支援的動作：$ACTION"
+    exit 1
+    ;;
+esac
+
+IFS=',' read -r -a EXT_ARRAY <<< "$EXTS"
+
+to_lower() { echo "$1" | tr 'A-Z' 'a-z'; }
+
+matches_ext() {
+  local file="$1"
+  local base ext ext_l
+  base="$(basename "$file")"
+  case "$base" in *.*) ;; *) return 1 ;; esac
+  ext="${base##*.}"
+  ext_l="$(to_lower "$ext")"
+
+  for e in "${EXT_ARRAY[@]}"; do
+    e="${e#.}"
+    e="$(to_lower "$e")"
+    [ "$ext_l" = "$e" ] && return 0
+  done
+  return 1
+}
+
+if [ "$ACTION" = "move" ] || [ "$ACTION" = "copy" ]; then
+  mkdir -p "$DEST"
+fi
+
+echo "=== 設定摘要 ==="
+echo "模式：依副檔名"
+echo "動作：$ACTION"
+echo "來源：$SRC"
+[ -n "$DEST" ] && echo "目標：$DEST"
+echo "副檔名：$EXTS"
+if [ "$ACTION" = "move" ] || [ "$ACTION" = "copy" ]; then
+  echo "保留資料夾結構：$([ $KEEP_STRUCTURE -eq 1 ] && echo '是（含母資料夾）' || echo '否')"
+fi
+echo "================"
+echo
+
+find "$SRC" -type f | while IFS= read -r file; do
+  matches_ext "$file" || continue
+
+  case "$ACTION" in
+    preview)
+      echo "[preview] $file"
+      ;;
+    delete)
+      echo "刪除：$file"
+      rm "$file"
+      ;;
+    move|copy)
+      rel="${file#$SRC/}"
+      rel_dir="$(dirname "$rel")"
+
+      if [ $KEEP_STRUCTURE -eq 1 ]; then
+        if [ "$rel_dir" = "." ]; then
+          target_dir="$DEST/$SRC_BASENAME"
+        else
+          target_dir="$DEST/$SRC_BASENAME/$rel_dir"
+        fi
+      else
+        target_dir="$DEST"
+      fi
+
+      mkdir -p "$target_dir"
+      target_path="$target_dir/$(basename "$file")"
+
+      echo "$ACTION: $file -> $target_path"
+      if [ "$ACTION" = "move" ]; then
+        mv "$file" "$target_path"
+      else
+        cp "$file" "$target_path"
+      fi
+      ;;
+  esac
+done
+
+echo
+echo "完成。"
